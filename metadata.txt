@@ -1,0 +1,26 @@
+[general]
+name=TransformToolbar
+description=Replicates the Manifold System Release 8.0 transform toolbar (target, operator, parameter) for vectors and rasters
+version=1.0.0
+author=Martin Denver G. Baldovi
+email=martin@baldovi.me
+
+# QGIS 4.0 minimum and maximum (Qt6)
+qgisMinimumVersion=4.0
+qgisMaximumVersion=4.99
+
+# Plugin is experimental? (set to False for stable)
+experimental=False
+deprecated=False
+
+# Tags (comma separated)
+tags=transform,processing,manifold,toolbar,vector,raster
+
+# Homepage
+homepage=https://github.com/martinbaldovi/TransformToolbar
+
+# Repository
+repository=https://github.com/martinbaldovi/TransformToolbar
+
+# Changelog
+changelog=Initial release for QGIS 4.0 – supports buffer, dissolve, clip, intersection, union, difference, simplify, centroids (vectors); clip raster, resample, reproject, translate (rasters)
