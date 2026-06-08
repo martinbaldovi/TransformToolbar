@@ -3,13 +3,16 @@
 TransformToolbar – Manifold‑style transform toolbar for QGIS 4.0 (Qt6)
 """
 
+import tempfile
+import os
+import time
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QToolBar, QComboBox, QPushButton, QWidget, QHBoxLayout,
-    QSpinBox, QDoubleSpinBox, QLineEdit, QLabel
+    QSpinBox, QDoubleSpinBox, QLineEdit, QLabel, QFileDialog
 )
 from qgis.core import (
-    QgsProject, QgsVectorLayer, QgsRasterLayer,
+    QgsProject, QgsVectorLayer, QgsRasterLayer, QgsUnitTypes,
     QgsProcessingFeatureSourceDefinition, QgsProcessingFeedback,
     QgsMessageLog, Qgis
 )
@@ -17,10 +20,7 @@ from qgis import processing
 
 
 class TransformToolbar:
-    """Main plugin class that creates and manages the Transform Toolbar."""
-
     def __init__(self, iface):
-        """Initialize the plugin with the QGIS interface."""
         self.iface = iface
         self.toolbar = None
         self.target_combo = None
@@ -30,64 +30,51 @@ class TransformToolbar:
         self.current_layer = None
 
     def initGui(self):
-        """Create the toolbar and its widgets when the plugin is loaded."""
-        # Remove any existing instance of the toolbar
         existing = self.iface.mainWindow().findChild(QToolBar, "TransformToolbar")
         if existing:
             existing.deleteLater()
 
-        # Create the main toolbar
         self.toolbar = QToolBar("Transform Toolbar")
         self.toolbar.setObjectName("TransformToolbar")
         self.toolbar.setWindowTitle("Transform Toolbar")
 
-        # --- Target box (scope) ---
         self.target_combo = QComboBox()
         self.target_combo.addItems(["All features", "Selected features"])
         self.target_combo.setToolTip("Apply transformation to all or only selected features")
         self.toolbar.addWidget(self.target_combo)
 
-        # --- Operator box (transformation) ---
         self.operator_combo = QComboBox()
         self.operator_combo.setToolTip("Choose a transformation operation")
         self.operator_combo.currentTextChanged.connect(self.on_operator_changed)
         self.toolbar.addWidget(self.operator_combo)
 
-        # --- Parameter box (dynamic) ---
         self.param_widget = QWidget()
         param_layout = QHBoxLayout(self.param_widget)
         param_layout.setContentsMargins(0, 0, 0, 0)
         self.toolbar.addWidget(self.param_widget)
 
-        # --- Apply button ---
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setToolTip("Execute the transformation")
         self.apply_btn.clicked.connect(self.run_transformation)
         self.toolbar.addWidget(self.apply_btn)
 
-        # Add toolbar to QGIS main window
         self.iface.mainWindow().addToolBar(self.toolbar)
         self.toolbar.setVisible(True)
 
-        # Connect signals to update the operator list when the active layer changes
         self.iface.mapCanvas().currentLayerChanged.connect(self.on_current_layer_changed)
-        # Initial update
         self.on_current_layer_changed(self.iface.mapCanvas().currentLayer())
 
     def unload(self):
-        """Clean up when the plugin is unloaded."""
         if self.toolbar:
             self.toolbar.deleteLater()
             self.toolbar = None
 
     def on_current_layer_changed(self, layer):
-        """Update the operator list when a new layer becomes active."""
         self.current_layer = layer
         self.update_operator_list()
-        self.on_operator_changed()  # refresh parameter widget
+        self.on_operator_changed()
 
     def update_operator_list(self):
-        """Populate the operator combo box based on the current layer type."""
         self.operator_combo.clear()
         if not self.current_layer:
             self.operator_combo.addItem("No active layer")
@@ -99,7 +86,6 @@ class TransformToolbar:
         self.apply_btn.setEnabled(True)
 
         if isinstance(self.current_layer, QgsVectorLayer):
-            # Vector operators (matching common Processing algorithms)
             ops = [
                 ("Buffer", "native:buffer"),
                 ("Dissolve", "native:dissolve"),
@@ -108,10 +94,10 @@ class TransformToolbar:
                 ("Union", "native:union"),
                 ("Difference", "native:difference"),
                 ("Simplify", "native:simplifygeometries"),
-                ("Centroids", "native:centroids")
+                ("Centroids", "native:centroids"),
+                ("Reproject", "native:reprojectlayer")  # Vector reproject
             ]
         elif isinstance(self.current_layer, QgsRasterLayer):
-            # Raster operators
             ops = [
                 ("Clip raster by mask", "gdal:cliprasterbymasklayer"),
                 ("Resample", "gdal:warpreproject"),
@@ -126,75 +112,142 @@ class TransformToolbar:
             self.operator_combo.addItem(display_name, algo_name)
 
     def on_operator_changed(self):
-        """Rebuild the parameter widget when the operator changes."""
         if not self.current_layer or self.operator_combo.count() == 0:
             return
 
         operator_text = self.operator_combo.currentText()
         layout = self.param_widget.layout()
-        # Clear existing widget
         while layout.count():
             child = layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
 
-        # Create a new parameter widget based on the selected operator
         param_widget = self._create_parameter_widget(operator_text)
         if param_widget:
             layout.addWidget(param_widget)
         else:
-            # Add a placeholder label if no parameters needed
-            label = QLabel("No additional parameters")
-            layout.addWidget(label)
+            layout.addWidget(QLabel("No additional parameters"))
+
+    def _get_vector_unit_string_and_type(self):
+        """Return (unit_string, is_degrees) for the current vector layer's CRS."""
+        if not isinstance(self.current_layer, QgsVectorLayer):
+            return ("units", False)
+        crs = self.current_layer.crs()
+        if not crs.isValid():
+            return ("units", False)
+        try:
+            unit = crs.mapUnits()
+            unit_string = QgsUnitTypes.toString(unit).lower()
+            is_degrees = (unit == QgsUnitTypes.DistanceUnit.Degrees)
+            return (unit_string, is_degrees)
+        except Exception:
+            return ("units", False)
+
+    def _get_raster_unit_string_and_type(self):
+        """Return (unit_string, is_degrees) for the current raster layer's CRS."""
+        if not isinstance(self.current_layer, QgsRasterLayer):
+            return ("units", False)
+        crs = self.current_layer.crs()
+        if not crs.isValid():
+            return ("units", False)
+        try:
+            unit = crs.mapUnits()
+            unit_string = QgsUnitTypes.toString(unit).lower()
+            is_degrees = (unit == QgsUnitTypes.DistanceUnit.Degrees)
+            return (unit_string, is_degrees)
+        except Exception:
+            return ("units", False)
 
     def _create_parameter_widget(self, operator_text):
-        """Return a QWidget suitable for the given operator's parameters."""
         if operator_text == "Buffer":
             spin = QDoubleSpinBox()
-            spin.setRange(0.0, 1e9)
+            unit_string, is_degrees = self._get_vector_unit_string_and_type()
+            if is_degrees:
+                spin.setRange(0.00001, 1e9)
+                spin.setDecimals(6)
+                spin.setSingleStep(0.0001)
+            else:
+                spin.setRange(0.0, 1e9)
+                spin.setDecimals(3)
+                spin.setSingleStep(10.0)
             spin.setValue(100.0)
-            spin.setSuffix(" m")
-            spin.setToolTip("Buffer distance in map units")
+            spin.setSuffix(f" {unit_string}")
+            spin.setToolTip(f"Buffer distance in {unit_string}")
             return spin
         elif operator_text == "Simplify":
             spin = QDoubleSpinBox()
             spin.setRange(0.0, 1.0)
             spin.setValue(0.01)
             spin.setSuffix(" tolerance")
-            spin.setToolTip("Simplification tolerance (0 = no change, 1 = max)")
             return spin
         elif operator_text in ("Clip", "Intersection", "Union", "Difference"):
-            line_edit = QLineEdit()
-            line_edit.setPlaceholderText("Layer name or ID (e.g., 'buildings')")
-            line_edit.setToolTip("Enter the name of the overlay layer")
-            return line_edit
+            combo = QComboBox()
+            all_layers = QgsProject.instance().mapLayers().values()
+            vector_layers = [layer for layer in all_layers if isinstance(layer, QgsVectorLayer) and layer != self.current_layer]
+            if not vector_layers:
+                combo.addItem("No other vector layers available")
+                combo.setEnabled(False)
+            else:
+                for layer in vector_layers:
+                    combo.addItem(layer.name(), layer)
+            combo.setToolTip(f"Select the overlay vector layer for {operator_text} operation")
+            return combo
         elif operator_text.startswith("Clip raster by mask"):
-            line_edit = QLineEdit()
-            line_edit.setPlaceholderText("Mask layer name")
-            line_edit.setToolTip("Vector layer used as mask")
-            return line_edit
+            combo = QComboBox()
+            vector_layers = [layer for layer in QgsProject.instance().mapLayers().values()
+                             if isinstance(layer, QgsVectorLayer)]
+            if not vector_layers:
+                combo.addItem("No vector layers available")
+                combo.setEnabled(False)
+            else:
+                for layer in vector_layers:
+                    combo.addItem(layer.name(), layer)
+            combo.setToolTip("Select the vector mask layer for cookie‑cutter clip")
+            return combo
         elif operator_text == "Resample":
-            spin = QSpinBox()
-            spin.setRange(1, 1000)
-            spin.setValue(10)
-            spin.setSuffix(" m")
-            spin.setToolTip("Target cell size (meters)")
+            spin = QDoubleSpinBox()
+            unit_string, is_degrees = self._get_raster_unit_string_and_type()
+            if is_degrees:
+                min_val = 0.00001
+                decimals = 6
+                single_step = 0.0001
+            else:
+                min_val = 0.0001
+                decimals = 3
+                single_step = 1.0
+            spin.setRange(min_val, 1e9)
+            spin.setDecimals(decimals)
+            spin.setSingleStep(single_step)
+            spin.setValue(10.0)
+            spin.setSuffix(f" {unit_string}")
+            spin.setToolTip(f"Target cell size in {unit_string} (min: {min_val})")
             return spin
         elif operator_text == "Reproject":
+            # Both vector and raster reproject use an EPSG code input
             line_edit = QLineEdit()
             line_edit.setPlaceholderText("EPSG code (e.g., 3857)")
-            line_edit.setToolTip("Target CRS (EPSG code)")
+            line_edit.setToolTip("Enter target CRS as EPSG code (e.g., 3857 for Web Mercator, 4326 for WGS84)")
             return line_edit
         elif operator_text == "Translate (format change)":
-            line_edit = QLineEdit()
-            line_edit.setPlaceholderText("Output format (e.g., GTiff, PNG)")
-            line_edit.setToolTip("GDAL driver short name")
-            return line_edit
+            combo = QComboBox()
+            formats = [
+                ("GeoTIFF", "GTiff"),
+                ("JPEG", "JPEG"),
+                ("PNG", "PNG"),
+                ("JPEG2000", "JP2KAK"),
+                ("ERDAS Imagine", "HFA"),
+                ("ArcInfo ASCII Grid", "AAIGrid"),
+                ("NetCDF", "NetCDF"),
+                ("GeoPackage", "GPKG")
+            ]
+            for display_name, gdal_code in formats:
+                combo.addItem(display_name, gdal_code)
+            combo.setToolTip("Select the output raster format")
+            return combo
         else:
             return None
 
     def run_transformation(self):
-        """Execute the selected transformation using QGIS Processing."""
         if not self.current_layer:
             self.show_message("No active layer selected.", Qgis.Warning)
             return
@@ -205,58 +258,155 @@ class TransformToolbar:
             self.show_message(f"Unknown operator: {operator_text}", Qgis.Critical)
             return
 
-        # Determine scope (all or selected features)
+        # Special handling for Translate (format change)
+        if operator_text == "Translate (format change)":
+            self.run_translate_format_change()
+            return
+
         scope = self.target_combo.currentText()
         use_selection = (scope == "Selected features" and
                          isinstance(self.current_layer, QgsVectorLayer) and
                          self.current_layer.selectedFeatureCount() > 0)
 
-        # Build Processing parameters
         params = self._build_processing_params(operator_text, operator_algo, use_selection)
         if params is None:
-            return  # error already shown
+            return
 
-        # Run the algorithm
         feedback = QgsProcessingFeedback()
         try:
             result = processing.run(operator_algo, params, feedback=feedback)
-            if result and 'OUTPUT' in result:
-                output_layer = result['OUTPUT']
-                # Add output layer to the project if it's a new layer
-                if isinstance(output_layer, (QgsVectorLayer, QgsRasterLayer)):
-                    QgsProject.instance().addMapLayer(output_layer)
-                    self.show_message(
-                        f"Transformation '{operator_text}' completed. New layer added.",
-                        Qgis.Success
-                    )
+
+            # Handle raster output (explicit file path)
+            if operator_algo.startswith("gdal:"):
+                output_path = params.get('OUTPUT')
+                if output_path and os.path.exists(output_path):
+                    if operator_text.startswith("Clip raster by mask"):
+                        layer_name = f"Clipped ({self.current_layer.name()})"
+                    elif operator_text == "Resample":
+                        layer_name = f"Resampled ({self.current_layer.name()})"
+                    elif operator_text == "Reproject":
+                        layer_name = f"Reprojected ({self.current_layer.name()})"
+                    else:
+                        layer_name = f"{operator_text} result"
+                    raster_layer = QgsRasterLayer(output_path, layer_name)
+                    if raster_layer.isValid():
+                        QgsProject.instance().addMapLayer(raster_layer)
+                        self.iface.mapCanvas().setExtent(raster_layer.extent())
+                        self.iface.mapCanvas().refresh()
+                        self.show_message(f"Transformation completed. New raster '{layer_name}' added.", Qgis.Success)
+                    else:
+                        self.show_message(f"Output file exists but could not be loaded as a raster.", Qgis.Warning)
                 else:
-                    self.show_message(
-                        f"Transformation '{operator_text}' completed successfully.",
-                        Qgis.Info
-                    )
+                    self.show_message(f"Raster transformation completed but output file not found.", Qgis.Warning)
+                return
+
+            # Handle vector output (native algorithms)
+            if result and 'OUTPUT' in result:
+                output = result['OUTPUT']
+                if isinstance(output, (QgsVectorLayer, QgsRasterLayer)):
+                    # Set consistent name: "<Operation>_output"
+                    output.setName(f"{operator_text}_output")
+                    QgsProject.instance().addMapLayer(output)
+                    self.show_message(f"Transformation '{operator_text}' completed. Layer '{operator_text}_output' added.", Qgis.Success)
+                else:
+                    # If it's a string (file path) try to load as vector layer
+                    if isinstance(output, str) and os.path.exists(output):
+                        layer = QgsVectorLayer(output, f"{operator_text}_output", "ogr")
+                        if layer.isValid():
+                            QgsProject.instance().addMapLayer(layer)
+                            self.show_message(f"Transformation '{operator_text}' completed. Layer '{operator_text}_output' added.", Qgis.Success)
+                        else:
+                            self.show_message(f"Transformation '{operator_text}' completed but output layer could not be loaded.", Qgis.Warning)
+                    else:
+                        self.show_message(f"Transformation '{operator_text}' completed successfully.", Qgis.Info)
             else:
-                self.show_message(f"Transformation '{operator_text}' failed. See log for details.", Qgis.Warning)
+                self.show_message(f"Transformation '{operator_text}' failed. See log.", Qgis.Warning)
+
         except Exception as e:
             self.show_message(f"Error: {str(e)}", Qgis.Critical)
             QgsMessageLog.logMessage(str(e), "TransformToolbar", Qgis.Critical)
 
+    def run_translate_format_change(self):
+        """Handle 'Translate (format change)' with file save dialog."""
+        if not isinstance(self.current_layer, QgsRasterLayer):
+            self.show_message("Translate only works on raster layers.", Qgis.Warning)
+            return
+
+        combo = self.param_widget.layout().itemAt(0).widget()
+        if not isinstance(combo, QComboBox):
+            self.show_message("Invalid format selection widget.", Qgis.Critical)
+            return
+        gdal_format = combo.currentData()
+        format_display = combo.currentText()
+
+        extension_map = {
+            "GTiff": "tif",
+            "JPEG": "jpg",
+            "PNG": "png",
+            "JP2KAK": "jp2",
+            "HFA": "img",
+            "AAIGrid": "asc",
+            "NetCDF": "nc",
+            "GPKG": "gpkg"
+        }
+        extension = extension_map.get(gdal_format, "tif")
+
+        default_name = f"{self.current_layer.name()}_converted.{extension}"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self.iface.mainWindow(),
+            "Save Translated Raster As",
+            default_name,
+            f"{format_display} (*.{extension});;All files (*.*)"
+        )
+
+        if not output_path:
+            return
+
+        if not output_path.lower().endswith(f".{extension}"):
+            output_path = f"{output_path}.{extension}"
+
+        params = {
+            'INPUT': self.current_layer,
+            'OUTPUT': output_path,
+            'FORMAT': gdal_format,
+            'CREATE_OPTIONS': '',
+            'DATA_TYPE': 0,
+            'EXTRA': ''
+        }
+
+        feedback = QgsProcessingFeedback()
+        try:
+            result = processing.run("gdal:translate", params, feedback=feedback)
+            if result and 'OUTPUT' in result:
+                output_path = result['OUTPUT']
+                if os.path.exists(output_path):
+                    layer_name = f"{self.current_layer.name()} ({format_display})"
+                    raster_layer = QgsRasterLayer(output_path, layer_name)
+                    if raster_layer.isValid():
+                        QgsProject.instance().addMapLayer(raster_layer)
+                        self.iface.mapCanvas().setExtent(raster_layer.extent())
+                        self.iface.mapCanvas().refresh()
+                        self.show_message(f"Translation to {format_display} completed. New layer added.", Qgis.Success)
+                    else:
+                        self.show_message(f"File saved but could not be loaded: {output_path}", Qgis.Warning)
+                else:
+                    self.show_message("Translation completed but output file not found.", Qgis.Warning)
+            else:
+                self.show_message("Translation failed. See log for details.", Qgis.Warning)
+        except Exception as e:
+            self.show_message(f"Error during translation: {str(e)}", Qgis.Critical)
+            QgsMessageLog.logMessage(str(e), "TransformToolbar", Qgis.Critical)
+
     def _build_processing_params(self, operator_text, operator_algo, use_selection):
-        """Build the parameter dictionary for the selected algorithm."""
         params = {}
 
-        # Common input handling
         if operator_algo.startswith("native:"):
-            # Vector algorithms
             if use_selection:
                 params['INPUT'] = QgsProcessingFeatureSourceDefinition(
-                    self.current_layer.id(),
-                    selectedFeaturesOnly=True,
-                    featureLimit=-1
-                )
+                    self.current_layer.id(), selectedFeaturesOnly=True, featureLimit=-1)
             else:
                 params['INPUT'] = self.current_layer
         elif operator_algo.startswith("gdal:"):
-            # Raster algorithms
             params['INPUT'] = self.current_layer
             if use_selection:
                 self.show_message("Selection is ignored for raster layers.", Qgis.Warning)
@@ -264,11 +414,14 @@ class TransformToolbar:
             self.show_message(f"Unsupported algorithm type: {operator_algo}", Qgis.Critical)
             return None
 
-        # Set output to temporary layer (memory for vectors, temp file for rasters)
+        # Output handling
         if operator_algo.startswith("native:"):
             params['OUTPUT'] = 'memory:'
         else:
-            params['OUTPUT'] = 'TEMPORARY_OUTPUT'
+            # Create a unique temporary GeoTIFF file (Translate is handled separately)
+            temp_dir = tempfile.gettempdir()
+            temp_file = os.path.join(temp_dir, f"raster_output_{os.getpid()}_{int(time.time())}.tif")
+            params['OUTPUT'] = temp_file
 
         # Operator-specific parameters
         if operator_text == "Buffer":
@@ -280,59 +433,50 @@ class TransformToolbar:
             params['MITER_LIMIT'] = 2
 
         elif operator_text == "Dissolve":
-            params['FIELD'] = []  # dissolve all features
+            params['FIELD'] = []
 
         elif operator_text == "Simplify":
             spin = self.param_widget.layout().itemAt(0).widget()
             params['TOLERANCE'] = spin.value()
 
         elif operator_text in ("Clip", "Intersection", "Union", "Difference"):
-            line_edit = self.param_widget.layout().itemAt(0).widget()
-            overlay_name = line_edit.text().strip()
-            if not overlay_name:
-                self.show_message("Please enter the name of the overlay layer.", Qgis.Warning)
+            combo = self.param_widget.layout().itemAt(0).widget()
+            if not isinstance(combo, QComboBox) or combo.count() == 0 or not combo.currentData():
+                self.show_message("No valid overlay layer selected.", Qgis.Warning)
                 return None
-            overlay_layer = QgsProject.instance().mapLayersByName(overlay_name)
-            if not overlay_layer:
-                self.show_message(f"Overlay layer '{overlay_name}' not found.", Qgis.Warning)
-                return None
-            params['OVERLAY'] = overlay_layer[0]
+            params['OVERLAY'] = combo.currentData()
 
         elif operator_text.startswith("Clip raster by mask"):
-            line_edit = self.param_widget.layout().itemAt(0).widget()
-            mask_name = line_edit.text().strip()
-            if not mask_name:
-                self.show_message("Please enter the mask layer name.", Qgis.Warning)
+            combo = self.param_widget.layout().itemAt(0).widget()
+            if not isinstance(combo, QComboBox) or combo.count() == 0 or not combo.currentData():
+                self.show_message("No valid vector mask layer selected.", Qgis.Warning)
                 return None
-            mask_layer = QgsProject.instance().mapLayersByName(mask_name)
-            if not mask_layer:
-                self.show_message(f"Mask layer '{mask_name}' not found.", Qgis.Warning)
-                return None
-            params['MASK'] = mask_layer[0]
+            params['MASK'] = combo.currentData()
+            params['CROP_TO_CUTLINE'] = True
+            params['ALPHA_BAND'] = True
+            params['SET_RESOLUTION'] = False
 
         elif operator_text == "Resample":
             spin = self.param_widget.layout().itemAt(0).widget()
             params['TARGET_RESOLUTION'] = spin.value()
-            params['RESAMPLING'] = 0  # nearest neighbour
+            params['RESAMPLING'] = 0
 
         elif operator_text == "Reproject":
+            # Works for both vector and raster reproject (different algorithms but same parameter name)
             line_edit = self.param_widget.layout().itemAt(0).widget()
             epsg = line_edit.text().strip()
             if not epsg:
                 self.show_message("Please enter target EPSG code.", Qgis.Warning)
                 return None
             params['TARGET_CRS'] = f'EPSG:{epsg}'
+            # For vector reproject, we might also set OPERATION (default is "Convert geometry to target CRS")
+            if operator_algo == "native:reprojectlayer":
+                params['OPERATION'] = 0  # Convert geometry to target CRS
+                params['SMOOTH'] = False  # No smoothing of geometries
 
-        elif operator_text == "Translate (format change)":
-            line_edit = self.param_widget.layout().itemAt(0).widget()
-            fmt = line_edit.text().strip()
-            if not fmt:
-                self.show_message("Please enter output format (e.g., GTiff).", Qgis.Warning)
-                return None
-            params['FORMAT'] = fmt
+        # Translate is handled separately, so not here
 
         return params
 
     def show_message(self, text, level=Qgis.Info, duration=3):
-        """Display a message in the QGIS message bar."""
         self.iface.messageBar().pushMessage("Transform Toolbar", text, level=level, duration=duration)
