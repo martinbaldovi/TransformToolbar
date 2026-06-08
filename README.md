@@ -1,4 +1,4 @@
-# TransformToolbar
+# TransformToolbar Plugin for QGIS 4.0
 
 Replicates the Manifold System Release 8.0 transform toolbar (target, operator, parameter) for vectors and rasters
 
